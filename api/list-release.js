@@ -1,8 +1,11 @@
 // api/list-release.js
-// Robust list-release serverless function without ESM deps (no p-limit).
+// Serverless function: extracts film titles using <meta property="og:title" content="...">
+// and removes trailing " (....)" from the title (parentheses at the end).
+// Otherwise behavior is the same as before (robust fetching, per-item errors, TMDB lookups).
+
 const cheerio = require('cheerio');
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; list-release-api/1.5)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; list-release-api/1.6)';
 const REQUEST_TIMEOUT = 15000;
 const MAX_RETRIES = 3;
 // default concurrency lowered for stability; override with env LIST_CONCURRENCY
@@ -144,6 +147,27 @@ async function asyncMapLimit(inputs, limit, mapper) {
   return results;
 }
 
+/**
+ * Clean up title:
+ *  - prefer <meta property="og:title" content="...">
+ *  - fallback to other selectors if necessary
+ *  - remove trailing " (anything)" at the end of the string
+ */
+function extractCleanTitleFromHtml(html) {
+  const $ = cheerio.load(html);
+  // prefer og:title meta
+  let meta = $('meta[property="og:title"]').attr('content') || $('meta[name="og:title"]').attr('content');
+  let title = meta && meta.trim();
+  if (!title) {
+    // fallback to h1[itemprop="name"] or first h1/h2
+    title = $('h1[itemprop="name"]').first().text().trim() || $('h1').first().text().trim() || $('h2').first().text().trim() || '';
+  }
+  // remove trailing space + parentheses content if present, e.g. "Film Title (2021)" -> "Film Title"
+  // regex: remove the last occurrence of " ( ... )" at end of string
+  title = title.replace(/\s*\([^\)]*\)\s*$/, '').trim();
+  return title || null;
+}
+
 module.exports = async (req, res) => {
   try {
     if (req.method !== 'POST') return res.status(405).send('Only POST allowed');
@@ -223,9 +247,8 @@ module.exports = async (req, res) => {
       try {
         const r = await fetchWithRetries(filmUrl);
         const html = await r.text();
-        const $ = cheerio.load(html);
-        const title = $('h1[itemprop="name"]').first().text().trim() || $('h1').first().text().trim() || $('h2').first().text().trim();
-        if (title) filmResult.film_name = title;
+        const cleanTitle = extractCleanTitleFromHtml(html);
+        if (cleanTitle) filmResult.film_name = cleanTitle;
         const parsedTmdb = extractTmdbFromFilmHtml(html);
         if (parsedTmdb) filmResult.tmdb_id = parsedTmdb;
       } catch (filmErr) {
