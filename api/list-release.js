@@ -1,48 +1,57 @@
-// api/list-release.js
+// api/list-release.js (improved logging + robust per-item error handling)
 const cheerio = require('cheerio');
 const pLimit = require('p-limit');
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; list-release-api/1.3)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; list-release-api/1.4)';
 const REQUEST_TIMEOUT = 15000;
 const MAX_RETRIES = 3;
-const CONCURRENCY = 6;
+// default concurrency lowered for stability; override with env LIST_CONCURRENCY
+const CONCURRENCY = Number(process.env.LIST_CONCURRENCY || 3);
 
 function sleep(ms){ return new Promise(res => setTimeout(res, ms)); }
 
-async function fetchWithRetries(url, opts={}, max=MAX_RETRIES){
+/**
+ * fetch with retries + abort timeout using global fetch (Node 18+ / 22 supports fetch)
+ */
+async function fetchWithRetries(url, opts = {}, max = MAX_RETRIES) {
   let attempt = 0;
-  while(true){
+  while (true) {
     attempt++;
     try {
-      // use AbortController to time out (Vercel Node 22 supports global fetch)
       const controller = new AbortController();
-      const id = setTimeout(()=>controller.abort(), REQUEST_TIMEOUT);
-      const res = await fetch(url, {...opts, headers: {...(opts.headers||{}), 'User-Agent': USER_AGENT}, signal: controller.signal});
+      const id = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+      const res = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), 'User-Agent': USER_AGENT }, signal: controller.signal });
       clearTimeout(id);
-      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
       return res;
-    } catch (err){
-      if(attempt >= max) throw err;
-      const backoff = Math.min(8000, 400 * Math.pow(2, attempt));
-      await sleep(backoff + Math.random()*200);
+    } catch (err) {
+      // if last attempt, rethrow so caller can handle/log
+      if (attempt >= max) {
+        const e = new Error(`fetchWithRetries failed for ${url} after ${attempt} attempts: ${String(err && (err.message || err))}`);
+        e.cause = err;
+        throw e;
+      }
+      const backoff = Math.min(8000, 400 * (2 ** attempt));
+      console.warn(`[fetchWithRetries] attempt ${attempt} failed for ${url}: ${err && err.message ? err.message : err}. sleeping ${backoff}ms`);
+      await sleep(backoff + Math.random() * 200);
     }
   }
 }
 
-function parseListPageForSlugs(html){
+function parseListPageForSlugs(html) {
   const $ = cheerio.load(html);
   const arr = [];
   $('[data-item-slug]').each((i, el) => {
     const v = $(el).attr('data-item-slug');
-    if(v) arr.push(v.trim());
+    if (v) arr.push(v.trim());
   });
   return [...new Set(arr)];
 }
 
-function findPageCount(html){
+function findPageCount(html) {
   const $ = cheerio.load(html);
   const items = $('li.paginate-page');
-  if(!items || items.length === 0) return 1;
+  if (!items || items.length === 0) return 1;
   const last = items.last();
   const a = last.find('a').first();
   const txt = a.text().trim();
@@ -50,42 +59,43 @@ function findPageCount(html){
   return Number.isFinite(n) ? n : 1;
 }
 
-function extractTmdbFromFilmHtml(html){
+function extractTmdbFromFilmHtml(html) {
   const $ = cheerio.load(html);
   const el = $('[data-tmdb-id]').first();
-  if(!el || el.length === 0) return null;
+  if (!el || el.length === 0) return null;
   const raw = el.attr('data-tmdb-id');
-  if(!raw) return null;
+  if (!raw) return null;
   const num = parseInt(String(raw).trim(), 10);
   return Number.isFinite(num) ? num : null;
 }
 
-function isoToDDMM(iso){
-  if(!iso) return null;
+function isoToDDMM(iso) {
+  if (!iso) return null;
   const m = iso.match(/(\d{4})-(\d{2})-(\d{2})/);
-  if(!m) return null;
+  if (!m) return null;
   return `${m[3]}-${m[2]}-${m[1]}`;
 }
 
-async function tmdbReleaseDates(tmdbId, bearer){
-  if(!tmdbId) return null;
+async function tmdbReleaseDates(tmdbId, bearer) {
+  if (!tmdbId) return null;
   const url = `https://api.themoviedb.org/3/movie/${tmdbId}/release_dates`;
   const res = await fetchWithRetries(url, { headers: { Authorization: `Bearer ${bearer}`, accept: 'application/json' } });
   return res.json();
 }
 
-function extractDatesFromJson(json, countryIso){
-  if(!json || !json.results) return { country_earliest: null, type4_earliest_any_iso: null };
+function extractDatesFromJson(json, countryIso) {
+  if (!json || !json.results) return { country_earliest: null, type4_earliest_any_iso: null };
+
   const results = json.results;
 
-  // country earliest (across all types)
+  // country earliest (across all types) for the requested countryIso
   const entry = results.find(r => String(r.iso_3166_1 || '').toUpperCase() === String(countryIso).toUpperCase());
   const countryDates = [];
-  if(entry && Array.isArray(entry.release_dates)){
-    for(const rd of entry.release_dates){
-      if(rd && rd.release_date){
+  if (entry && Array.isArray(entry.release_dates)) {
+    for (const rd of entry.release_dates) {
+      if (rd && rd.release_date) {
         const m = rd.release_date.match(/(\d{4}-\d{2}-\d{2})/);
-        if(m) countryDates.push(m[1]);
+        if (m) countryDates.push(m[1]);
       }
     }
   }
@@ -93,15 +103,15 @@ function extractDatesFromJson(json, countryIso){
 
   // type 4 earliest across any ISO
   const type4Dates = [];
-  for(const r of results){
-    for(const rd of (r.release_dates || [])){
+  for (const r of results) {
+    for (const rd of (r.release_dates || [])) {
       try {
         const typ = Number(rd.type);
-        if(typ === 4 && rd.release_date){
+        if (typ === 4 && rd.release_date) {
           const m = rd.release_date.match(/(\d{4}-\d{2}-\d{2})/);
-          if(m) type4Dates.push(m[1]);
+          if (m) type4Dates.push(m[1]);
         }
-      } catch(e){}
+      } catch (e) { /* ignore */ }
     }
   }
   const type4_earliest_any_iso = type4Dates.length ? isoToDDMM(type4Dates.sort()[0]) : null;
@@ -111,85 +121,164 @@ function extractDatesFromJson(json, countryIso){
 
 module.exports = async (req, res) => {
   try {
-    if(req.method !== 'POST') return res.status(405).send('Only POST allowed');
-    const { username, listname, country } = req.body || {};
-    if(!username || !listname || !country) return res.status(400).send('username, listname and country are required');
+    if (req.method !== 'POST') return res.status(405).send('Only POST allowed');
+
+    const body = req.body || {};
+    const username = (body.username || '').trim();
+    const listname = (body.listname || '').trim();
+    const country = (body.country || '').trim();
+
+    if (!username || !listname || !country) {
+      return res.status(400).json({ ok: false, error: 'username, listname and country are required (POST JSON)' });
+    }
+
+    const tmdbBearer = process.env.TMDB_BEARER;
+    if (!tmdbBearer) {
+      console.warn('[startup] TMDB_BEARER missing in env — requests to TMDB will be skipped');
+    }
+
+    console.log(`[start] list-release request for username='${username}', list='${listname}', country='${country}', concurrency=${CONCURRENCY}`);
 
     const base = `https://letterboxd.com/${encodeURIComponent(username)}/list/${encodeURIComponent(listname)}/`;
-    const first = await fetchWithRetries(base);
-    const firstHtml = await first.text();
 
-    const pageCount = findPageCount(firstHtml);
-    const slugs = new Set(parseListPageForSlugs(firstHtml));
+    // fetch first page
+    let firstHtml;
+    try {
+      console.log('[step] fetching first list page', base);
+      const firstResp = await fetchWithRetries(base);
+      firstHtml = await firstResp.text();
+    } catch (err) {
+      console.error('[error] failed fetching first list page', err && err.message ? err.message : err);
+      return res.status(502).json({ ok: false, error: 'Failed fetching list first page', detail: String(err && (err.message || err)) });
+    }
 
-    // fetch remaining pages (if any)
-    for(let p = 2; p <= pageCount; p++){
-      try {
-        const pageUrl = `${base}page/${p}/`;
-        const r = await fetchWithRetries(pageUrl);
-        const txt = await r.text();
-        for(const s of parseListPageForSlugs(txt)) slugs.add(s);
-        await sleep(120 + Math.random()*120);
-      } catch(err){
-        console.warn('page error', p, err);
+    let pageCount = 1;
+    try {
+      pageCount = findPageCount(firstHtml);
+      console.log('[info] detected pageCount =', pageCount);
+    } catch (err) {
+      console.warn('[warn] failed to parse pageCount, defaulting to 1', err && err.message ? err.message : err);
+    }
+
+    // collect slugs
+    const slugs = new Set();
+    try {
+      for (const s of parseListPageForSlugs(firstHtml)) slugs.add(s);
+    } catch (err) {
+      console.warn('[warn] failed to parse slugs on first page', err && err.message ? err.message : err);
+    }
+
+    // fetch additional pages
+    if (pageCount > 1) {
+      console.log(`[step] fetching remaining ${pageCount - 1} pages`);
+      for (let p = 2; p <= pageCount; p++) {
+        try {
+          const pageUrl = `${base}page/${p}/`;
+          console.log(`[fetch] page ${p} -> ${pageUrl}`);
+          const r = await fetchWithRetries(pageUrl);
+          const txt = await r.text();
+          for (const s of parseListPageForSlugs(txt)) slugs.add(s);
+          // polite pause
+          await sleep(120 + Math.random() * 120);
+        } catch (pageErr) {
+          console.warn(`[warn] failed to fetch/parse page ${p}:`, pageErr && pageErr.message ? pageErr.message : pageErr);
+          // keep going
+        }
       }
     }
 
     const slugArray = Array.from(slugs);
-    const limit = pLimit(CONCURRENCY);
-    const bearer = process.env.TMDB_BEARER;
+    console.log('[info] total unique slugs collected =', slugArray.length);
 
-    const tasks = slugArray.map(slug => limit(async () => {
+    const limit = pLimit(CONCURRENCY);
+    const tasks = slugArray.map((slug, idx) => limit(async () => {
+      // each item returns object { film_query, film_name, tmdb_id, country_release, digital_release, error? }
+      const filmResult = { film_query: slug, film_name: null, tmdb_id: null, country_release: null, digital_release: null };
+
       const filmUrl = `https://letterboxd.com/film/${slug}/`;
-      let filmName = slug;
-      let tmdbId = null;
       try {
+        // fetch film page
         const r = await fetchWithRetries(filmUrl);
         const html = await r.text();
         const $ = cheerio.load(html);
-        // attempt better title selector (itemprop/name or first h1/h2)
+        // try robust title retrieval
         const title = $('h1[itemprop="name"]').first().text().trim() || $('h1').first().text().trim() || $('h2').first().text().trim();
-        if(title) filmName = title;
-        const parsed = extractTmdbFromFilmHtml(html);
-        if(parsed) tmdbId = parsed;
-      } catch(err){
-        console.warn('film page error for', slug, err);
+        if (title) filmResult.film_name = title;
+        // try tmdb id in page
+        const parsedTmdb = extractTmdbFromFilmHtml(html);
+        if (parsedTmdb) filmResult.tmdb_id = parsedTmdb;
+      } catch (filmErr) {
+        const msg = `failed fetching film page for ${slug}: ${filmErr && filmErr.message ? filmErr.message : filmErr}`;
+        console.warn('[warn]', msg);
+        filmResult.error = filmResult.error || [];
+        filmResult.error.push(msg);
+        // continue: if tmdb missing we'll skip TMDB, but we still want to include the film row
       }
 
-      let country_release = null;
-      let digital_release = null;
-      if(tmdbId && bearer){
+      // if we found tmdb_id and we have a bearer, call TMDB
+      if (filmResult.tmdb_id && tmdbBearer) {
         try {
-          const json = await tmdbReleaseDates(tmdbId, bearer);
-          const dd = extractDatesFromJson(json, country);
-          country_release = dd.country_earliest;
-          digital_release = dd.type4_earliest_any_iso;
-        } catch(err){
-          console.warn('tmdb error', tmdbId, err);
+          const json = await tmdbReleaseDates(filmResult.tmdb_id, tmdbBearer);
+          const extracted = extractDatesFromJson(json, country);
+          filmResult.country_release = extracted.country_earliest;
+          filmResult.digital_release = extracted.type4_earliest_any_iso;
+        } catch (tmdbErr) {
+          const msg = `TMDB error for id ${filmResult.tmdb_id}: ${tmdbErr && tmdbErr.message ? tmdbErr.message : tmdbErr}`;
+          console.warn('[warn]', msg);
+          filmResult.error = filmResult.error || [];
+          filmResult.error.push(msg);
+        }
+      } else {
+        if (!filmResult.tmdb_id) {
+          filmResult.error = filmResult.error || [];
+          filmResult.error.push('tmdb_id not found on film page');
+        } else if (!tmdbBearer) {
+          filmResult.error = filmResult.error || [];
+          filmResult.error.push('TMDB_BEARER env missing; skipped TMDB lookup');
         }
       }
 
-      // tiny jitter so we don't hammer Letterboxd
-      await sleep(60 + Math.random()*80);
-      return { film_query: slug, film_name: filmName, tmdb_id: tmdbId, country_release, digital_release };
+      // small jitter
+      await sleep(40 + Math.random() * 80);
+      return filmResult;
     }));
 
-    const results = await Promise.all(tasks);
+    // run tasks
+    let results;
+    try {
+      results = await Promise.all(tasks);
+    } catch (allErr) {
+      console.error('[error] tasks Promise.all failed:', allErr && allErr.message ? allErr.message : allErr);
+      // fallback: try to gather partial results by awaiting tasks individually
+      results = [];
+      for (const t of tasks) {
+        try {
+          // each t is a Promise-producing function call (we already called them above), but if Promise.all failed
+          // this fallback isn't likely to succeed. We'll break and return error.
+          break;
+        } catch (e) {
+          console.warn('[warn] fallback per-task failure', e && e.message ? e.message : e);
+        }
+      }
+      return res.status(500).json({ ok: false, error: 'Internal error while processing tasks', detail: String(allErr && allErr.message) });
+    }
 
-    // sort: country_earliest (asc), then digital_release (asc), then film_name; nulls last
-    function dateKey(d){ return d ? Number(d.split('-').reverse().join('')) : Number.MAX_SAFE_INTEGER; }
-    results.sort((a,b) => {
+    // Sorting: earliest -> newest; nulls go last
+    function dateKey(d) { return d ? Number(d.split('-').reverse().join('')) : Number.MAX_SAFE_INTEGER; }
+    results.sort((a, b) => {
       const k1 = dateKey(a.country_release) - dateKey(b.country_release);
-      if(k1 !== 0) return k1;
+      if (k1 !== 0) return k1;
       const k2 = dateKey(a.digital_release) - dateKey(b.digital_release);
-      if(k2 !== 0) return k2;
-      return ( (a.film_name||'').localeCompare(b.film_name||'') );
+      if (k2 !== 0) return k2;
+      return ( (a.film_name || '').localeCompare(b.film_name || '') );
     });
 
+    console.log('[done] returning results count =', results.length);
     res.setHeader('Content-Type', 'application/json');
-    return res.status(200).send(JSON.stringify(results));
+    return res.status(200).send(JSON.stringify({ ok: true, results }));
   } catch (err) {
-    console.error(err);
-    return res.status(500).send(String(err && err.message ? err.message : err));
+    console.error('[fatal] unexpected error', err && err.stack ? err.stack : err);
+    // return safe error payload
+    return res.status(500).json({ ok: false, error: 'Unexpected server error', detail: String(err && (err.message || err)) });
   }
 };
