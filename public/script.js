@@ -1,4 +1,9 @@
-// script.js — frontend posts to /api/list-release (same origin when deployed on Vercel)
+// public/script.js
+// Frontend that POSTs to /api/list-release and accepts either:
+//  - an array (old behavior), or
+//  - { ok: true, results: [...] } (newer server behaviour).
+// Renders movie rows and per-item error messages (if any).
+
 const form = document.getElementById('form');
 const statusEl = document.getElementById('status');
 const resultsSection = document.getElementById('results');
@@ -10,7 +15,10 @@ function showStatus(msg, isError = false) {
   statusEl.textContent = msg;
   statusEl.style.color = isError ? '#ffb3b3' : '';
 }
-function hideStatus() { statusEl.classList.add('hidden'); statusEl.textContent = ''; }
+function hideStatus() {
+  statusEl.classList.add('hidden');
+  statusEl.textContent = '';
+}
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -22,9 +30,13 @@ form.addEventListener('submit', async (e) => {
   const listname = document.getElementById('listname').value.trim();
   const country = document.getElementById('country').value.trim().toUpperCase();
 
-  if (!username || !listname || !country) { showStatus('Fill all fields', true); return; }
+  if (!username || !listname || !country) {
+    showStatus('Please fill username, list slug and country ISO.', true);
+    return;
+  }
+
   countryLabel.textContent = country;
-  showStatus('Fetching list and release dates — this may take some seconds...');
+  showStatus('Fetching list and release dates — this may take a few seconds...');
 
   try {
     const resp = await fetch('/api/list-release', {
@@ -34,23 +46,38 @@ form.addEventListener('submit', async (e) => {
     });
 
     if (!resp.ok) {
-      const txt = await resp.text();
-      throw new Error(`Server error ${resp.status}: ${txt}`);
+      const txt = await resp.text().catch(() => '');
+      throw new Error(`Server error ${resp.status}${txt ? `: ${txt}` : ''}`);
     }
 
-    const data = await resp.json();
-    if (!Array.isArray(data)) throw new Error('Invalid server response');
+    const json = await resp.json().catch(() => null);
+    if (!json) throw new Error('Invalid JSON response from server');
 
-    if (data.length === 0) {
-      showStatus('No films found.', true);
+    // Accept either an array or the object { ok: true, results: [...] }
+    let rows = null;
+    if (Array.isArray(json)) {
+      rows = json;
+    } else if (json && typeof json === 'object' && Array.isArray(json.results)) {
+      if (json.ok === false) {
+        // server indicated failure
+        const msg = json.error || 'Server returned ok=false';
+        throw new Error(msg);
+      }
+      rows = json.results;
+    } else {
+      throw new Error('Invalid server response structure');
+    }
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      showStatus('No films found in the list (or response empty).', true);
       return;
     }
 
     hideStatus();
-    renderTable(data);
+    renderTable(rows);
   } catch (err) {
     console.error(err);
-    showStatus('Error: ' + err.message, true);
+    showStatus('Error: ' + (err.message || String(err)), true);
   }
 });
 
@@ -66,6 +93,16 @@ document.getElementById('clear').addEventListener('click', () => {
 function renderTable(rows) {
   resultsSection.classList.remove('hidden');
   tbody.innerHTML = '';
+
+  // If table has no "Error" column, add it
+  const thead = document.querySelector('thead tr');
+  if (!thead.querySelector('.col-error')) {
+    const th = document.createElement('th');
+    th.textContent = 'Error';
+    th.className = 'col-error';
+    thead.appendChild(th);
+  }
+
   rows.forEach((r, i) => {
     const tr = document.createElement('tr');
 
@@ -75,9 +112,10 @@ function renderTable(rows) {
 
     const tdName = document.createElement('td');
     const a = document.createElement('a');
-    a.href = `https://letterboxd.com/film/${r.film_query}/`;
-    a.textContent = r.film_name || r.film_query;
-    a.target = '_blank'; a.rel = 'noopener noreferrer';
+    a.href = `https://letterboxd.com/film/${r.film_query || ''}/`;
+    a.textContent = r.film_name || r.film_query || '';
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
     a.className = 'film-link';
     tdName.appendChild(a);
     tr.appendChild(tdName);
@@ -94,6 +132,11 @@ function renderTable(rows) {
     tdId.textContent = r.tmdb_id || '';
     tdId.className = 'small-muted';
     tr.appendChild(tdId);
+
+    const tdError = document.createElement('td');
+    tdError.textContent = (Array.isArray(r.error) ? r.error.join(' | ') : (r.error || '')) || '';
+    tdError.style.color = '#ffb3b3';
+    tr.appendChild(tdError);
 
     tbody.appendChild(tr);
   });
