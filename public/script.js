@@ -1,9 +1,4 @@
-// public/script.js
-// Frontend that POSTs to /api/list-release and accepts either:
-//  - an array (old behavior), or
-//  - { ok: true, results: [...] } (newer server behaviour).
-// Renders movie rows and per-item error messages (if any).
-
+// public/script.js — updated to send excludePremieres flag and render types
 const form = document.getElementById('form');
 const statusEl = document.getElementById('status');
 const resultsSection = document.getElementById('results');
@@ -20,6 +15,16 @@ function hideStatus() {
   statusEl.textContent = '';
 }
 
+function typeLetter(typeNum) {
+  if (!typeNum && typeNum !== 0) return '';
+  const n = Number(typeNum);
+  if (n === 3) return 'T';
+  if (n === 4) return 'D';
+  if (n === 5) return 'P';
+  if (n === 6) return 'TV';
+  return String(n);
+}
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   hideStatus();
@@ -29,6 +34,7 @@ form.addEventListener('submit', async (e) => {
   const username = document.getElementById('username').value.trim();
   const listname = document.getElementById('listname').value.trim();
   const country = document.getElementById('country').value.trim().toUpperCase();
+  const excludePremisesChecked = document.getElementById('excludePremieres').checked || false;
 
   if (!username || !listname || !country) {
     showStatus('Please fill username, list slug and country ISO.', true);
@@ -42,7 +48,7 @@ form.addEventListener('submit', async (e) => {
     const resp = await fetch('/api/list-release', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, listname, country })
+      body: JSON.stringify({ username, listname, country, excludePremieres: excludePremisesChecked })
     });
 
     if (!resp.ok) {
@@ -53,13 +59,11 @@ form.addEventListener('submit', async (e) => {
     const json = await resp.json().catch(() => null);
     if (!json) throw new Error('Invalid JSON response from server');
 
-    // Accept either an array or the object { ok: true, results: [...] }
     let rows = null;
     if (Array.isArray(json)) {
       rows = json;
     } else if (json && typeof json === 'object' && Array.isArray(json.results)) {
       if (json.ok === false) {
-        // server indicated failure
         const msg = json.error || 'Server returned ok=false';
         throw new Error(msg);
       }
@@ -85,6 +89,7 @@ document.getElementById('clear').addEventListener('click', () => {
   document.getElementById('username').value = '';
   document.getElementById('listname').value = '';
   document.getElementById('country').value = '';
+  document.getElementById('excludePremieres').checked = false;
   tbody.innerHTML = '';
   resultsSection.classList.add('hidden');
   hideStatus();
@@ -94,20 +99,12 @@ function renderTable(rows) {
   resultsSection.classList.remove('hidden');
   tbody.innerHTML = '';
 
-  // If table has no "Error" column, add it
-  const thead = document.querySelector('thead tr');
-  if (!thead.querySelector('.col-error')) {
-    const th = document.createElement('th');
-    th.textContent = 'Error';
-    th.className = 'col-error';
-    thead.appendChild(th);
-  }
-
   rows.forEach((r, i) => {
     const tr = document.createElement('tr');
 
     const tdIndex = document.createElement('td');
     tdIndex.textContent = (i + 1).toString();
+    tdIndex.className = 'center';
     tr.appendChild(tdIndex);
 
     const tdName = document.createElement('td');
@@ -121,21 +118,30 @@ function renderTable(rows) {
     tr.appendChild(tdName);
 
     const tdCountry = document.createElement('td');
-    tdCountry.textContent = r.country_release || '';
+    tdCountry.className = 'center';
+    if (r.country_release) {
+      const letter = typeLetter(r.country_release_type) || '';
+      tdCountry.textContent = letter ? `${r.country_release} (${letter})` : r.country_release;
+    } else tdCountry.textContent = '';
     tr.appendChild(tdCountry);
 
     const tdDigital = document.createElement('td');
-    tdDigital.textContent = r.digital_release || '';
+    tdDigital.className = 'center';
+    if (r.digital_release) {
+      const letter = typeLetter(r.digital_release_type) || '';
+      tdDigital.textContent = letter ? `${r.digital_release} (${letter})` : r.digital_release;
+    } else tdDigital.textContent = '';
     tr.appendChild(tdDigital);
 
     const tdId = document.createElement('td');
+    tdId.className = 'center small-muted';
     tdId.textContent = r.tmdb_id || '';
-    tdId.className = 'small-muted';
     tr.appendChild(tdId);
 
     const tdError = document.createElement('td');
-    tdError.textContent = (Array.isArray(r.error) ? r.error.join(' | ') : (r.error || '')) || '';
+    tdError.className = 'center';
     tdError.style.color = '#ffb3b3';
+    tdError.textContent = (Array.isArray(r.error) ? r.error.join(' | ') : (r.error || '')) || '';
     tr.appendChild(tdError);
 
     tbody.appendChild(tr);

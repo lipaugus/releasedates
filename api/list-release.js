@@ -1,21 +1,13 @@
 // api/list-release.js
-// Serverless function: extracts film titles using <meta property="og:title" content="...">
-// and removes trailing " (....)" from the title (parentheses at the end).
-// Otherwise behavior is the same as before (robust fetching, per-item errors, TMDB lookups).
-
 const cheerio = require('cheerio');
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; list-release-api/1.6)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; list-release-api/1.7)';
 const REQUEST_TIMEOUT = 15000;
 const MAX_RETRIES = 3;
-// default concurrency lowered for stability; override with env LIST_CONCURRENCY
 const CONCURRENCY = Number(process.env.LIST_CONCURRENCY || 3);
 
 function sleep(ms){ return new Promise(res => setTimeout(res, ms)); }
 
-/**
- * fetch with retries + abort timeout using global fetch (Node 22 supports fetch)
- */
 async function fetchWithRetries(url, opts = {}, max = MAX_RETRIES) {
   let attempt = 0;
   while (true) {
@@ -85,44 +77,90 @@ async function tmdbReleaseDates(tmdbId, bearer) {
   return res.json();
 }
 
-function extractDatesFromJson(json, countryIso) {
-  if (!json || !json.results) return { country_earliest: null, type4_earliest_any_iso: null };
+/**
+ * Extract dates and types.
+ *
+ * If allowedTypesForCountry is null => allow all types;
+ * otherwise only count rd.type in allowedTypesForCountry when computing country_earliest.
+ *
+ * Returns:
+ *  { country_earliest (string|null), country_earliest_type (number|null),
+ *    type4_earliest_any_iso (string|null), type4_type (number|null) }
+ */
+function extractDatesFromJsonWithTypes(json, countryIso, allowedTypesForCountry = null) {
+  if (!json || !json.results) return {
+    country_earliest: null, country_earliest_type: null,
+    type4_earliest_any_iso: null, type4_type: null
+  };
+
   const results = json.results;
 
-  // country earliest (across all types)
+  // COUNTRY earliest (consider allowedTypesForCountry if provided)
+  let bestCountryDate = null;
+  let bestCountryType = null;
   const entry = results.find(r => String(r.iso_3166_1 || '').toUpperCase() === String(countryIso).toUpperCase());
-  const countryDates = [];
   if (entry && Array.isArray(entry.release_dates)) {
     for (const rd of entry.release_dates) {
-      if (rd && rd.release_date) {
-        const m = rd.release_date.match(/(\d{4}-\d{2}-\d{2})/);
-        if (m) countryDates.push(m[1]);
+      const rdType = Number.isFinite(Number(rd.type)) ? Number(rd.type) : null;
+      if (!rd.release_date) continue;
+      if (allowedTypesForCountry && Array.isArray(allowedTypesForCountry) && rdType !== null) {
+        if (!allowedTypesForCountry.includes(rdType)) continue;
+      }
+      const m = rd.release_date.match(/(\d{4}-\d{2}-\d{2})/);
+      if (!m) continue;
+      const isoDate = m[1];
+      if (!bestCountryDate || isoDate < bestCountryDate) {
+        bestCountryDate = isoDate;
+        bestCountryType = rdType;
       }
     }
   }
-  const country_earliest = countryDates.length ? isoToDDMM(countryDates.sort()[0]) : null;
+  const country_earliest = bestCountryDate ? isoToDDMM(bestCountryDate) : null;
+  const country_earliest_type = bestCountryType !== undefined ? bestCountryType : null;
 
-  // type 4 earliest across any ISO
-  const type4Dates = [];
+  // TYPE 4 earliest across any ISO
+  let bestType4 = null;
   for (const r of results) {
     for (const rd of (r.release_dates || [])) {
-      try {
-        const typ = Number(rd.type);
-        if (typ === 4 && rd.release_date) {
-          const m = rd.release_date.match(/(\d{4}-\d{2}-\d{2})/);
-          if (m) type4Dates.push(m[1]);
-        }
-      } catch (e) { /* ignore */ }
+      const rdType = Number.isFinite(Number(rd.type)) ? Number(rd.type) : null;
+      if (rdType !== 4) continue;
+      if (!rd.release_date) continue;
+      const m = rd.release_date.match(/(\d{4}-\d{2}-\d{2})/);
+      if (!m) continue;
+      const isoDate = m[1];
+      if (!bestType4 || isoDate < bestType4) bestType4 = isoDate;
     }
   }
-  const type4_earliest_any_iso = type4Dates.length ? isoToDDMM(type4Dates.sort()[0]) : null;
+  const type4_earliest_any_iso = bestType4 ? isoToDDMM(bestType4) : null;
+  const type4_type = type4_earliest_any_iso ? 4 : null;
 
-  return { country_earliest, type4_earliest_any_iso };
+  return {
+    country_earliest,
+    country_earliest_type,
+    type4_earliest_any_iso,
+    type4_type
+  };
 }
 
 /**
- * asyncMapLimit: map 'inputs' to results using async mapper with concurrency limit.
- * Preserves original order in returned array.
+ * Clean up title:
+ *  - prefer <meta property="og:title" content="...">
+ *  - fallback to other selectors if necessary
+ *  - remove trailing " (....)" at the end
+ */
+function extractCleanTitleFromHtml(html) {
+  const $ = cheerio.load(html);
+  let meta = $('meta[property="og:title"]').attr('content') || $('meta[name="og:title"]').attr('content');
+  let title = meta && meta.trim();
+  if (!title) {
+    title = $('h1[itemprop="name"]').first().text().trim() || $('h1').first().text().trim() || $('h2').first().text().trim() || '';
+  }
+  title = title.replace(/\s*\([^\)]*\)\s*$/, '').trim();
+  return title || null;
+}
+
+/**
+ * asyncMapLimit implementation preserving order
  */
 async function asyncMapLimit(inputs, limit, mapper) {
   const results = new Array(inputs.length);
@@ -147,27 +185,6 @@ async function asyncMapLimit(inputs, limit, mapper) {
   return results;
 }
 
-/**
- * Clean up title:
- *  - prefer <meta property="og:title" content="...">
- *  - fallback to other selectors if necessary
- *  - remove trailing " (anything)" at the end of the string
- */
-function extractCleanTitleFromHtml(html) {
-  const $ = cheerio.load(html);
-  // prefer og:title meta
-  let meta = $('meta[property="og:title"]').attr('content') || $('meta[name="og:title"]').attr('content');
-  let title = meta && meta.trim();
-  if (!title) {
-    // fallback to h1[itemprop="name"] or first h1/h2
-    title = $('h1[itemprop="name"]').first().text().trim() || $('h1').first().text().trim() || $('h2').first().text().trim() || '';
-  }
-  // remove trailing space + parentheses content if present, e.g. "Film Title (2021)" -> "Film Title"
-  // regex: remove the last occurrence of " ( ... )" at end of string
-  title = title.replace(/\s*\([^\)]*\)\s*$/, '').trim();
-  return title || null;
-}
-
 module.exports = async (req, res) => {
   try {
     if (req.method !== 'POST') return res.status(405).send('Only POST allowed');
@@ -176,6 +193,7 @@ module.exports = async (req, res) => {
     const username = (body.username || '').trim();
     const listname = (body.listname || '').trim();
     const country = (body.country || '').trim();
+    const excludePremieres = !!body.excludePremieres; // boolean
 
     if (!username || !listname || !country) {
       return res.status(400).json({ ok: false, error: 'username, listname and country are required (POST JSON)' });
@@ -186,7 +204,7 @@ module.exports = async (req, res) => {
       console.warn('[startup] TMDB_BEARER missing in env — requests to TMDB will be skipped');
     }
 
-    console.log(`[start] list-release request for username='${username}', list='${listname}', country='${country}', concurrency=${CONCURRENCY}`);
+    console.log(`[start] list-release request for username='${username}', list='${listname}', country='${country}', excludePremieres=${excludePremieres}, concurrency=${CONCURRENCY}`);
 
     const base = `https://letterboxd.com/${encodeURIComponent(username)}/list/${encodeURIComponent(listname)}/`;
 
@@ -227,11 +245,9 @@ module.exports = async (req, res) => {
           const r = await fetchWithRetries(pageUrl);
           const txt = await r.text();
           for (const s of parseListPageForSlugs(txt)) slugs.add(s);
-          // polite pause
           await sleep(120 + Math.random() * 120);
         } catch (pageErr) {
           console.warn(`[warn] failed to fetch/parse page ${p}:`, pageErr && pageErr.message ? pageErr.message : pageErr);
-          // keep going
         }
       }
     }
@@ -239,9 +255,18 @@ module.exports = async (req, res) => {
     const slugArray = Array.from(slugs);
     console.log('[info] total unique slugs collected =', slugArray.length);
 
-    // map slugs -> results with concurrency limit
+    const allowedTypesForCountry = excludePremieres ? [3,4,5,6] : null;
+
     const results = await asyncMapLimit(slugArray, CONCURRENCY, async (slug) => {
-      const filmResult = { film_query: slug, film_name: null, tmdb_id: null, country_release: null, digital_release: null };
+      const filmResult = {
+        film_query: slug,
+        film_name: null,
+        tmdb_id: null,
+        country_release: null,
+        country_release_type: null,
+        digital_release: null,
+        digital_release_type: null
+      };
 
       const filmUrl = `https://letterboxd.com/film/${slug}/`;
       try {
@@ -261,9 +286,11 @@ module.exports = async (req, res) => {
       if (filmResult.tmdb_id && tmdbBearer) {
         try {
           const json = await tmdbReleaseDates(filmResult.tmdb_id, tmdbBearer);
-          const extracted = extractDatesFromJson(json, country);
+          const extracted = extractDatesFromJsonWithTypes(json, country, allowedTypesForCountry);
           filmResult.country_release = extracted.country_earliest;
+          filmResult.country_release_type = extracted.country_earliest_type;
           filmResult.digital_release = extracted.type4_earliest_any_iso;
+          filmResult.digital_release_type = extracted.type4_type;
         } catch (tmdbErr) {
           const msg = `TMDB error for id ${filmResult.tmdb_id}: ${tmdbErr && tmdbErr.message ? tmdbErr.message : tmdbErr}`;
           console.warn('[warn]', msg);
@@ -280,7 +307,6 @@ module.exports = async (req, res) => {
         }
       }
 
-      // tiny jitter
       await sleep(40 + Math.random() * 80);
       return filmResult;
     });

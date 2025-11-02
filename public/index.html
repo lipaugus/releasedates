@@ -25,6 +25,13 @@
         </label>
       </div>
 
+      <div class="row checkbox-row">
+        <label class="checkbox-label">
+          <input type="checkbox" id="excludePremieres" />
+          <span>Exclude premieres / festivals (only count types 3,4,5,6 for Theatre)</span>
+        </label>
+      </div>
+
       <div class="actions">
         <button id="submit" type="submit">Fetch</button>
         <button id="clear" type="button" class="muted">Clear</button>
@@ -39,9 +46,10 @@
           <tr>
             <th>#</th>
             <th>Film</th>
-            <th>Theatre (<span id="countryLabel">AR</span>)</th>
-            <th>Digital</th>
-            <th>tmdb_id</th>
+            <th class="center-col">Theatre (<span id="countryLabel">AR</span>)</th>
+            <th class="center-col">Digital</th>
+            <th class="center-col">tmdb_id</th>
+            <th class="center-col">Error</th>
           </tr>
         </thead>
         <tbody></tbody>
