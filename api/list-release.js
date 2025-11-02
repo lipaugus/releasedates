@@ -311,13 +311,19 @@ module.exports = async (req, res) => {
       return filmResult;
     });
 
-    // Sorting: earliest -> newest; nulls go last
+    // NEW sorting: sort by the earliest available date between country_release and digital_release (earliest -> newest),
+    // then by film_name alphabetical. Rows with no dates go last.
     function dateKey(d) { return d ? Number(d.split('-').reverse().join('')) : Number.MAX_SAFE_INTEGER; }
+    function earliestKey(item) {
+      const a = dateKey(item.country_release);
+      const b = dateKey(item.digital_release);
+      return Math.min(a, b);
+    }
+
     results.sort((a, b) => {
-      const k1 = dateKey(a.country_release) - dateKey(b.country_release);
-      if (k1 !== 0) return k1;
-      const k2 = dateKey(a.digital_release) - dateKey(b.digital_release);
-      if (k2 !== 0) return k2;
+      const ka = earliestKey(a);
+      const kb = earliestKey(b);
+      if (ka !== kb) return ka - kb;
       return ( (a.film_name || '').localeCompare(b.film_name || '') );
     });
 
