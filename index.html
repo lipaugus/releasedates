@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Letterboxd List Release Dates</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>List Release Dates — Letterboxd</h1>
+
+    <form id="form" class="form">
+      <div class="row">
+        <label for="username">Username</label>
+        <input id="username" name="username" placeholder="eg. lucasv2" required />
+      </div>
+
+      <div class="row">
+        <label for="listname">List slug</label>
+        <input id="listname" name="listname" placeholder="eg. my-favorites" required />
+      </div>
+
+      <div class="row">
+        <label for="country">Country ISO (2 letters)</label>
+        <input id="country" name="country" placeholder="eg. AR, US, GB" maxlength="2" required />
+      </div>
+
+      <div class="row actions">
+        <button id="submit">Fetch release dates</button>
+        <button id="clear" type="button" class="text-btn">Clear</button>
+      </div>
+    </form>
+
+    <section id="status" class="status hidden"></section>
+
+    <section id="results" class="results hidden">
+      <table id="table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Film</th>
+            <th>Theatre (<span id="countryLabel">AR</span>)</th>
+            <th>Digital (type 4)</th>
+            <th>tmdb_id</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <footer class="foot">
+      <small>Note: the backend performs scraping and TMDB queries; deploy backend and set <code>API_BASE</code> in script.js.</small>
+    </footer>
+  </main>
+
+  <script src="script.js" defer></script>
+</body>
+</html>
