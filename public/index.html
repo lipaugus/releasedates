@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>List Release Dates — Letterboxd</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>Letterboxd list → release dates</h1>
+
+    <form id="form" class="form" autocomplete="off">
+      <div class="inputs">
+        <label><span>Username</span>
+          <input id="username" placeholder="e.g. lucasv2" required />
+        </label>
+
+        <label><span>List slug</span>
+          <input id="listname" placeholder="e.g. my-favourite-films" required />
+        </label>
+
+        <label><span>Country ISO</span>
+          <input id="country" placeholder="e.g. AR, US, GB" maxlength="2" required />
+        </label>
+      </div>
+
+      <div class="actions">
+        <button id="submit" type="submit">Fetch</button>
+        <button id="clear" type="button" class="muted">Clear</button>
+      </div>
+    </form>
+
+    <div id="status" class="status hidden"></div>
+
+    <section id="results" class="results hidden">
+      <table id="table" class="table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Film</th>
+            <th>Theatre (<span id="countryLabel">AR</span>)</th>
+            <th>Digital</th>
+            <th>tmdb_id</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <footer class="foot">
+      <small>Deployed backend must have TMDB_BEARER env var set. Backend does the scraping and TMDB queries.</small>
+    </footer>
+  </main>
+
+  <script src="/script.js" defer></script>
+</body>
+</html>

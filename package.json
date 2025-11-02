@@ -1,0 +1,9 @@
+{
+  "name": "list-release-vercel",
+  "version": "1.0.0",
+  "engines": { "node": "18.x" },
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12",
+    "p-limit": "^4.0.0"
+  }
+}
