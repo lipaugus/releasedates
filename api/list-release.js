@@ -2,7 +2,7 @@
 const cheerio = require('cheerio');
 const pLimit = require('p-limit');
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; list-release-api/1.2)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; list-release-api/1.3)';
 const REQUEST_TIMEOUT = 15000;
 const MAX_RETRIES = 3;
 const CONCURRENCY = 6;
@@ -14,6 +14,7 @@ async function fetchWithRetries(url, opts={}, max=MAX_RETRIES){
   while(true){
     attempt++;
     try {
+      // use AbortController to time out (Vercel Node 22 supports global fetch)
       const controller = new AbortController();
       const id = setTimeout(()=>controller.abort(), REQUEST_TIMEOUT);
       const res = await fetch(url, {...opts, headers: {...(opts.headers||{}), 'User-Agent': USER_AGENT}, signal: controller.signal});
@@ -77,11 +78,11 @@ function extractDatesFromJson(json, countryIso){
   if(!json || !json.results) return { country_earliest: null, type4_earliest_any_iso: null };
   const results = json.results;
 
-  // AR earliest (countryIso) across any types
-  const countryEntry = results.find(r => String(r.iso_3166_1).toUpperCase() === String(countryIso).toUpperCase());
-  let countryDates = [];
-  if(countryEntry && Array.isArray(countryEntry.release_dates)){
-    for(const rd of countryEntry.release_dates){
+  // country earliest (across all types)
+  const entry = results.find(r => String(r.iso_3166_1 || '').toUpperCase() === String(countryIso).toUpperCase());
+  const countryDates = [];
+  if(entry && Array.isArray(entry.release_dates)){
+    for(const rd of entry.release_dates){
       if(rd && rd.release_date){
         const m = rd.release_date.match(/(\d{4}-\d{2}-\d{2})/);
         if(m) countryDates.push(m[1]);
@@ -104,6 +105,7 @@ function extractDatesFromJson(json, countryIso){
     }
   }
   const type4_earliest_any_iso = type4Dates.length ? isoToDDMM(type4Dates.sort()[0]) : null;
+
   return { country_earliest, type4_earliest_any_iso };
 }
 
@@ -120,7 +122,7 @@ module.exports = async (req, res) => {
     const pageCount = findPageCount(firstHtml);
     const slugs = new Set(parseListPageForSlugs(firstHtml));
 
-    // fetch remaining pages
+    // fetch remaining pages (if any)
     for(let p = 2; p <= pageCount; p++){
       try {
         const pageUrl = `${base}page/${p}/`;
@@ -136,6 +138,7 @@ module.exports = async (req, res) => {
     const slugArray = Array.from(slugs);
     const limit = pLimit(CONCURRENCY);
     const bearer = process.env.TMDB_BEARER;
+
     const tasks = slugArray.map(slug => limit(async () => {
       const filmUrl = `https://letterboxd.com/film/${slug}/`;
       let filmName = slug;
@@ -144,12 +147,13 @@ module.exports = async (req, res) => {
         const r = await fetchWithRetries(filmUrl);
         const html = await r.text();
         const $ = cheerio.load(html);
+        // attempt better title selector (itemprop/name or first h1/h2)
         const title = $('h1[itemprop="name"]').first().text().trim() || $('h1').first().text().trim() || $('h2').first().text().trim();
         if(title) filmName = title;
         const parsed = extractTmdbFromFilmHtml(html);
         if(parsed) tmdbId = parsed;
       } catch(err){
-        // ignore per-film fetch errors
+        console.warn('film page error for', slug, err);
       }
 
       let country_release = null;
@@ -165,13 +169,14 @@ module.exports = async (req, res) => {
         }
       }
 
+      // tiny jitter so we don't hammer Letterboxd
       await sleep(60 + Math.random()*80);
       return { film_query: slug, film_name: filmName, tmdb_id: tmdbId, country_release, digital_release };
     }));
 
     const results = await Promise.all(tasks);
 
-    // sort: country earliest (asc), then digital earliest (asc), then name; nulls last
+    // sort: country_earliest (asc), then digital_release (asc), then film_name; nulls last
     function dateKey(d){ return d ? Number(d.split('-').reverse().join('')) : Number.MAX_SAFE_INTEGER; }
     results.sort((a,b) => {
       const k1 = dateKey(a.country_release) - dateKey(b.country_release);
