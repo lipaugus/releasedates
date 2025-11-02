@@ -1,8 +1,8 @@
-// api/list-release.js (improved logging + robust per-item error handling)
+// api/list-release.js
+// Robust list-release serverless function without ESM deps (no p-limit).
 const cheerio = require('cheerio');
-const pLimit = require('p-limit');
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; list-release-api/1.4)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; list-release-api/1.5)';
 const REQUEST_TIMEOUT = 15000;
 const MAX_RETRIES = 3;
 // default concurrency lowered for stability; override with env LIST_CONCURRENCY
@@ -11,7 +11,7 @@ const CONCURRENCY = Number(process.env.LIST_CONCURRENCY || 3);
 function sleep(ms){ return new Promise(res => setTimeout(res, ms)); }
 
 /**
- * fetch with retries + abort timeout using global fetch (Node 18+ / 22 supports fetch)
+ * fetch with retries + abort timeout using global fetch (Node 22 supports fetch)
  */
 async function fetchWithRetries(url, opts = {}, max = MAX_RETRIES) {
   let attempt = 0;
@@ -25,7 +25,6 @@ async function fetchWithRetries(url, opts = {}, max = MAX_RETRIES) {
       if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
       return res;
     } catch (err) {
-      // if last attempt, rethrow so caller can handle/log
       if (attempt >= max) {
         const e = new Error(`fetchWithRetries failed for ${url} after ${attempt} attempts: ${String(err && (err.message || err))}`);
         e.cause = err;
@@ -85,10 +84,9 @@ async function tmdbReleaseDates(tmdbId, bearer) {
 
 function extractDatesFromJson(json, countryIso) {
   if (!json || !json.results) return { country_earliest: null, type4_earliest_any_iso: null };
-
   const results = json.results;
 
-  // country earliest (across all types) for the requested countryIso
+  // country earliest (across all types)
   const entry = results.find(r => String(r.iso_3166_1 || '').toUpperCase() === String(countryIso).toUpperCase());
   const countryDates = [];
   if (entry && Array.isArray(entry.release_dates)) {
@@ -117,6 +115,33 @@ function extractDatesFromJson(json, countryIso) {
   const type4_earliest_any_iso = type4Dates.length ? isoToDDMM(type4Dates.sort()[0]) : null;
 
   return { country_earliest, type4_earliest_any_iso };
+}
+
+/**
+ * asyncMapLimit: map 'inputs' to results using async mapper with concurrency limit.
+ * Preserves original order in returned array.
+ */
+async function asyncMapLimit(inputs, limit, mapper) {
+  const results = new Array(inputs.length);
+  let idx = 0;
+
+  async function worker() {
+    while (true) {
+      const i = idx++;
+      if (i >= inputs.length) return;
+      try {
+        results[i] = await mapper(inputs[i], i);
+      } catch (err) {
+        results[i] = { error: String(err && (err.message || err)) };
+      }
+    }
+  }
+
+  const workers = [];
+  const n = Math.min(limit, inputs.length || 1);
+  for (let i = 0; i < n; i++) workers.push(worker());
+  await Promise.all(workers);
+  return results;
 }
 
 module.exports = async (req, res) => {
@@ -190,21 +215,17 @@ module.exports = async (req, res) => {
     const slugArray = Array.from(slugs);
     console.log('[info] total unique slugs collected =', slugArray.length);
 
-    const limit = pLimit(CONCURRENCY);
-    const tasks = slugArray.map((slug, idx) => limit(async () => {
-      // each item returns object { film_query, film_name, tmdb_id, country_release, digital_release, error? }
+    // map slugs -> results with concurrency limit
+    const results = await asyncMapLimit(slugArray, CONCURRENCY, async (slug) => {
       const filmResult = { film_query: slug, film_name: null, tmdb_id: null, country_release: null, digital_release: null };
 
       const filmUrl = `https://letterboxd.com/film/${slug}/`;
       try {
-        // fetch film page
         const r = await fetchWithRetries(filmUrl);
         const html = await r.text();
         const $ = cheerio.load(html);
-        // try robust title retrieval
         const title = $('h1[itemprop="name"]').first().text().trim() || $('h1').first().text().trim() || $('h2').first().text().trim();
         if (title) filmResult.film_name = title;
-        // try tmdb id in page
         const parsedTmdb = extractTmdbFromFilmHtml(html);
         if (parsedTmdb) filmResult.tmdb_id = parsedTmdb;
       } catch (filmErr) {
@@ -212,10 +233,8 @@ module.exports = async (req, res) => {
         console.warn('[warn]', msg);
         filmResult.error = filmResult.error || [];
         filmResult.error.push(msg);
-        // continue: if tmdb missing we'll skip TMDB, but we still want to include the film row
       }
 
-      // if we found tmdb_id and we have a bearer, call TMDB
       if (filmResult.tmdb_id && tmdbBearer) {
         try {
           const json = await tmdbReleaseDates(filmResult.tmdb_id, tmdbBearer);
@@ -238,30 +257,10 @@ module.exports = async (req, res) => {
         }
       }
 
-      // small jitter
+      // tiny jitter
       await sleep(40 + Math.random() * 80);
       return filmResult;
-    }));
-
-    // run tasks
-    let results;
-    try {
-      results = await Promise.all(tasks);
-    } catch (allErr) {
-      console.error('[error] tasks Promise.all failed:', allErr && allErr.message ? allErr.message : allErr);
-      // fallback: try to gather partial results by awaiting tasks individually
-      results = [];
-      for (const t of tasks) {
-        try {
-          // each t is a Promise-producing function call (we already called them above), but if Promise.all failed
-          // this fallback isn't likely to succeed. We'll break and return error.
-          break;
-        } catch (e) {
-          console.warn('[warn] fallback per-task failure', e && e.message ? e.message : e);
-        }
-      }
-      return res.status(500).json({ ok: false, error: 'Internal error while processing tasks', detail: String(allErr && allErr.message) });
-    }
+    });
 
     // Sorting: earliest -> newest; nulls go last
     function dateKey(d) { return d ? Number(d.split('-').reverse().join('')) : Number.MAX_SAFE_INTEGER; }
@@ -278,7 +277,6 @@ module.exports = async (req, res) => {
     return res.status(200).send(JSON.stringify({ ok: true, results }));
   } catch (err) {
     console.error('[fatal] unexpected error', err && err.stack ? err.stack : err);
-    // return safe error payload
     return res.status(500).json({ ok: false, error: 'Unexpected server error', detail: String(err && (err.message || err)) });
   }
 };
