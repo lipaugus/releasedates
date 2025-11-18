@@ -13,21 +13,21 @@
     <form id="form" class="form" autocomplete="off">
       <div class="inputs">
         <label><span>Username</span>
-          <input id="username" placeholder="e.g. lucasv2" required />
+          <input id="username" value="lucasv2" required />
         </label>
 
         <label><span>List slug</span>
-          <input id="listname" placeholder="e.g. my-favourite-films" required />
+          <input id="listname" value="a-seguir" required />
         </label>
 
         <label><span>Country ISO</span>
-          <input id="country" placeholder="e.g. AR, US, GB" maxlength="2" required />
+          <input id="country" value="AR" maxlength="2" required />
         </label>
       </div>
 
       <div class="row checkbox-row">
         <label class="checkbox-label">
-          <input type="checkbox" id="excludePremieres" />
+          <input type="checkbox" id="excludePremieres" checked="true"/>
           <span>Exclude premieres / festivals (only count types 3,4,5,6 for Theatre)</span>
         </label>
       </div>
