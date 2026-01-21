@@ -3,31 +3,33 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>List Release Dates — Letterboxd</title>
+  <title>List Release Dates — TMDB (from Google Sheet)</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <main class="container">
-    <h1>Letterboxd list → release dates</h1>
+    <h1>Sheet list → release dates (TMDB)</h1>
 
     <form id="form" class="form" autocomplete="off">
       <div class="inputs">
-        <label><span>Username</span>
-          <input id="username" value="lucasv2" required />
+        <label>
+          <span>Google Sheets URL</span>
+          <input
+            id="sheetUrl"
+            value="https://docs.google.com/spreadsheets/d/1YlCdpwKBZL2i8WdRInEHkhdMWFBQtBB9y4GsfF7LE6M/edit?usp=sharing"
+            required
+          />
         </label>
 
-        <label><span>List slug</span>
-          <input id="listname" value="a-seguir" required />
-        </label>
-
-        <label><span>Country ISO</span>
+        <label>
+          <span>Country ISO</span>
           <input id="country" value="AR" maxlength="2" required />
         </label>
       </div>
 
       <div class="row checkbox-row">
         <label class="checkbox-label">
-          <input type="checkbox" id="excludePremieres" checked="true"/>
+          <input type="checkbox" id="excludePremieres" checked />
           <span>Exclude premieres / festivals (only count types 3,4,5,6 for Theatre)</span>
         </label>
       </div>
@@ -57,7 +59,7 @@
     </section>
 
     <footer class="foot">
-      <small>Deployed backend must have TMDB_BEARER env var set. Backend does the scraping and TMDB queries.</small>
+      <small>Deployed backend must have TMDB_BEARER env var set. Backend does the TMDB queries.</small>
     </footer>
   </main>
 

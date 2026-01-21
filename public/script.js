@@ -1,4 +1,4 @@
-// public/script.js — updated to send excludePremieres flag and render types
+// public/script.js — uses Google Sheets URL (CSV) as source of tmdb ids
 const form = document.getElementById('form');
 const statusEl = document.getElementById('status');
 const resultsSection = document.getElementById('results');
@@ -31,24 +31,23 @@ form.addEventListener('submit', async (e) => {
   resultsSection.classList.add('hidden');
   tbody.innerHTML = '';
 
-  const username = document.getElementById('username').value.trim();
-  const listname = document.getElementById('listname').value.trim();
+  const sheetUrl = document.getElementById('sheetUrl').value.trim();
   const country = document.getElementById('country').value.trim().toUpperCase();
-  const excludePremisesChecked = document.getElementById('excludePremieres').checked || false;
+  const excludePremieresChecked = document.getElementById('excludePremieres').checked || false;
 
-  if (!username || !listname || !country) {
-    showStatus('Please fill username, list slug and country ISO.', true);
+  if (!sheetUrl || !country) {
+    showStatus('Please fill Google Sheets URL and country ISO.', true);
     return;
   }
 
   countryLabel.textContent = country;
-  showStatus('Fetching list and release dates — this may take a few seconds...');
+  showStatus('Fetching TMDB release dates — this may take a few seconds...');
 
   try {
     const resp = await fetch('/api/list-release', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, listname, country, excludePremieres: excludePremisesChecked })
+      body: JSON.stringify({ sheetUrl, country, excludePremieres: excludePremieresChecked })
     });
 
     if (!resp.ok) {
@@ -73,7 +72,7 @@ form.addEventListener('submit', async (e) => {
     }
 
     if (!Array.isArray(rows) || rows.length === 0) {
-      showStatus('No films found in the list (or response empty).', true);
+      showStatus('No films found in the sheet (or response empty).', true);
       return;
     }
 
@@ -86,8 +85,7 @@ form.addEventListener('submit', async (e) => {
 });
 
 document.getElementById('clear').addEventListener('click', () => {
-  document.getElementById('username').value = '';
-  document.getElementById('listname').value = '';
+  document.getElementById('sheetUrl').value = '';
   document.getElementById('country').value = '';
   document.getElementById('excludePremieres').checked = false;
   tbody.innerHTML = '';
@@ -109,8 +107,8 @@ function renderTable(rows) {
 
     const tdName = document.createElement('td');
     const a = document.createElement('a');
-    a.href = `https://letterboxd.com/film/${r.film_query || ''}/`;
-    a.textContent = r.film_name || r.film_query || '';
+    a.href = `https://www.themoviedb.org/movie/${r.tmdb_id || ''}`;
+    a.textContent = r.film_name || r.tmdb_id || '';
     a.target = '_blank';
     a.rel = 'noopener noreferrer';
     a.className = 'film-link';
