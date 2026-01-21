@@ -1,36 +1,96 @@
 // api/list-release.js
+// Improved anti-blocking: UA rotation, richer headers, optional proxy fallback (SCRAPER_PROXY?url=...).
 const cheerio = require('cheerio');
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; list-release-api/1.7)';
 const REQUEST_TIMEOUT = 15000;
-const MAX_RETRIES = 3;
-const CONCURRENCY = Number(process.env.LIST_CONCURRENCY || 3);
+const MAX_RETRIES = 4;
+const DEFAULT_CONCURRENCY = 1; // polite default; raise with env LIST_CONCURRENCY
+const CONCURRENCY = Number(process.env.LIST_CONCURRENCY || DEFAULT_CONCURRENCY);
+
+// Optional proxy: if set, we'll request `${SCRAPER_PROXY}?url=${encodeURIComponent(url)}`
+// Example: SCRAPER_PROXY="https://my-proxy.example/scrape"
+const SCRAPER_PROXY = process.env.SCRAPER_PROXY || null;
+
+const UA_LIST = [
+  // a small rotation of common UAs
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:119.0) Gecko/20100101 Firefox/119.0"
+];
 
 function sleep(ms){ return new Promise(res => setTimeout(res, ms)); }
 
-async function fetchWithRetries(url, opts = {}, max = MAX_RETRIES) {
+async function fetchWithRetriesRaw(url, opts = {}, maxAttempts = MAX_RETRIES) {
+  // If a proxy is configured, transform the target URL to the proxy route
+  const proxy = SCRAPER_PROXY;
+  const targetUrl = proxy ? `${proxy}?url=${encodeURIComponent(url)}` : url;
+
   let attempt = 0;
   while (true) {
     attempt++;
     try {
+      // Build headers with rotating UA and standard headers
+      const ua = UA_LIST[(attempt - 1) % UA_LIST.length];
+      const defaultHeaders = {
+        'User-Agent': ua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://letterboxd.com/',
+        'Connection': 'keep-alive'
+      };
+      const headers = { ...(opts.headers || {}), ...defaultHeaders };
+
+      // Use AbortController for timeout
       const controller = new AbortController();
       const id = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-      const res = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), 'User-Agent': USER_AGENT }, signal: controller.signal });
+
+      const res = await fetch(targetUrl, { ...opts, headers, signal: controller.signal });
       clearTimeout(id);
-      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+
+      // If using a proxy, the proxy is expected to return 200 with scraped HTML.
+      // If proxy returns an error code, treat accordingly.
+      if (!res.ok) {
+        // If direct request was blocked with 403 and we didn't yet try all UA strings, try again
+        const status = res.status;
+        const bodyText = await res.text().catch(() => '');
+        // Special handling: if 403 and we can still switch UA, retry without counting as final attempt yet
+        if ((status === 403 || status === 429) && attempt < maxAttempts) {
+          const backoff = Math.min(4000, 300 * (2 ** attempt));
+          console.warn(`[fetchWithRetriesRaw] got ${status} for ${url} (attempt ${attempt}). Retrying after ${backoff}ms. UA=${ua}`);
+          await sleep(backoff + Math.random() * 200);
+          continue;
+        }
+        // final: throw with helpful context
+        const err = new Error(`HTTP ${status} for ${url} (proxy=${Boolean(proxy)}). Response snippet: ${bodyText.slice(0,200)}`);
+        err.status = status;
+        throw err;
+      }
+
+      // success
       return res;
     } catch (err) {
-      if (attempt >= max) {
+      // timeout or network error
+      if (attempt >= maxAttempts) {
         const e = new Error(`fetchWithRetries failed for ${url} after ${attempt} attempts: ${String(err && (err.message || err))}`);
         e.cause = err;
         throw e;
       }
-      const backoff = Math.min(8000, 400 * (2 ** attempt));
-      console.warn(`[fetchWithRetries] attempt ${attempt} failed for ${url}: ${err && err.message ? err.message : err}. sleeping ${backoff}ms`);
-      await sleep(backoff + Math.random() * 200);
+      const backoff = Math.min(8000, 300 * (2 ** attempt));
+      console.warn(`[fetchWithRetriesRaw] attempt ${attempt} failed for ${url}: ${err && (err.message || err)}; sleeping ${backoff}ms`);
+      await sleep(backoff + Math.random() * 300);
     }
   }
 }
+
+// Convenience wrapper which returns text directly and logs a little context
+async function fetchHtml(url) {
+  const resp = await fetchWithRetriesRaw(url);
+  const txt = await resp.text();
+  return txt;
+}
+
+/* --- reuse the same helpers used previously --- */
 
 function parseListPageForSlugs(html) {
   const $ = cheerio.load(html);
@@ -73,20 +133,10 @@ function isoToDDMM(iso) {
 async function tmdbReleaseDates(tmdbId, bearer) {
   if (!tmdbId) return null;
   const url = `https://api.themoviedb.org/3/movie/${tmdbId}/release_dates`;
-  const res = await fetchWithRetries(url, { headers: { Authorization: `Bearer ${bearer}`, accept: 'application/json' } });
+  const res = await fetchWithRetriesRaw(url, { headers: { Authorization: `Bearer ${bearer}`, accept: 'application/json' } }, MAX_RETRIES);
   return res.json();
 }
 
-/**
- * Extract dates and types.
- *
- * If allowedTypesForCountry is null => allow all types;
- * otherwise only count rd.type in allowedTypesForCountry when computing country_earliest.
- *
- * Returns:
- *  { country_earliest (string|null), country_earliest_type (number|null),
- *    type4_earliest_any_iso (string|null), type4_type (number|null) }
- */
 function extractDatesFromJsonWithTypes(json, countryIso, allowedTypesForCountry = null) {
   if (!json || !json.results) return {
     country_earliest: null, country_earliest_type: null,
@@ -95,7 +145,6 @@ function extractDatesFromJsonWithTypes(json, countryIso, allowedTypesForCountry 
 
   const results = json.results;
 
-  // COUNTRY earliest (consider allowedTypesForCountry if provided)
   let bestCountryDate = null;
   let bestCountryType = null;
   const entry = results.find(r => String(r.iso_3166_1 || '').toUpperCase() === String(countryIso).toUpperCase());
@@ -118,7 +167,7 @@ function extractDatesFromJsonWithTypes(json, countryIso, allowedTypesForCountry 
   const country_earliest = bestCountryDate ? isoToDDMM(bestCountryDate) : null;
   const country_earliest_type = bestCountryType !== undefined ? bestCountryType : null;
 
-  // TYPE 4 earliest across any ISO
+  // type 4 earliest across any ISO
   let bestType4 = null;
   for (const r of results) {
     for (const rd of (r.release_dates || [])) {
@@ -142,12 +191,6 @@ function extractDatesFromJsonWithTypes(json, countryIso, allowedTypesForCountry 
   };
 }
 
-/**
- * Clean up title:
- *  - prefer <meta property="og:title" content="...">
- *  - fallback to other selectors if necessary
- *  - remove trailing " (....)" at the end
- */
 function extractCleanTitleFromHtml(html) {
   const $ = cheerio.load(html);
   let meta = $('meta[property="og:title"]').attr('content') || $('meta[name="og:title"]').attr('content');
@@ -159,9 +202,6 @@ function extractCleanTitleFromHtml(html) {
   return title || null;
 }
 
-/**
- * asyncMapLimit implementation preserving order
- */
 async function asyncMapLimit(inputs, limit, mapper) {
   const results = new Array(inputs.length);
   let idx = 0;
@@ -188,12 +228,11 @@ async function asyncMapLimit(inputs, limit, mapper) {
 module.exports = async (req, res) => {
   try {
     if (req.method !== 'POST') return res.status(405).send('Only POST allowed');
-
     const body = req.body || {};
     const username = (body.username || '').trim();
     const listname = (body.listname || '').trim();
     const country = (body.country || '').trim();
-    const excludePremieres = !!body.excludePremieres; // boolean
+    const excludePremieres = !!body.excludePremieres;
 
     if (!username || !listname || !country) {
       return res.status(400).json({ ok: false, error: 'username, listname and country are required (POST JSON)' });
@@ -201,77 +240,56 @@ module.exports = async (req, res) => {
 
     const tmdbBearer = process.env.TMDB_BEARER;
     if (!tmdbBearer) {
-      console.warn('[startup] TMDB_BEARER missing in env — requests to TMDB will be skipped');
+      console.warn('[startup] TMDB_BEARER missing in env — TMDB lookups skipped');
     }
 
-    console.log(`[start] list-release request for username='${username}', list='${listname}', country='${country}', excludePremieres=${excludePremieres}, concurrency=${CONCURRENCY}`);
+    console.log(`[start] ${username} / ${listname} country=${country} excludePremises=${excludePremieres} concurrency=${CONCURRENCY}`);
 
     const base = `https://letterboxd.com/${encodeURIComponent(username)}/list/${encodeURIComponent(listname)}/`;
 
-    // fetch first page
+    // try to fetch first page. If blocked with 403 we will rotate UA and/or rely on proxy if provided.
     let firstHtml;
     try {
-      console.log('[step] fetching first list page', base);
-      const firstResp = await fetchWithRetries(base);
-      firstHtml = await firstResp.text();
+      firstHtml = await fetchHtml(base);
     } catch (err) {
-      console.error('[error] failed fetching first list page', err && err.message ? err.message : err);
+      console.error('[error] failed fetching first list page: ', err && err.message ? err.message : err);
       return res.status(502).json({ ok: false, error: 'Failed fetching list first page', detail: String(err && (err.message || err)) });
     }
 
     let pageCount = 1;
-    try {
-      pageCount = findPageCount(firstHtml);
-      console.log('[info] detected pageCount =', pageCount);
-    } catch (err) {
-      console.warn('[warn] failed to parse pageCount, defaulting to 1', err && err.message ? err.message : err);
-    }
+    try { pageCount = findPageCount(firstHtml); } catch(e){ pageCount = 1; }
 
-    // collect slugs
     const slugs = new Set();
-    try {
-      for (const s of parseListPageForSlugs(firstHtml)) slugs.add(s);
-    } catch (err) {
-      console.warn('[warn] failed to parse slugs on first page', err && err.message ? err.message : err);
-    }
+    try { for (const s of parseListPageForSlugs(firstHtml)) slugs.add(s); } catch(e){}
 
-    // fetch additional pages
     if (pageCount > 1) {
-      console.log(`[step] fetching remaining ${pageCount - 1} pages`);
       for (let p = 2; p <= pageCount; p++) {
         try {
           const pageUrl = `${base}page/${p}/`;
-          console.log(`[fetch] page ${p} -> ${pageUrl}`);
-          const r = await fetchWithRetries(pageUrl);
-          const txt = await r.text();
-          for (const s of parseListPageForSlugs(txt)) slugs.add(s);
-          await sleep(120 + Math.random() * 120);
-        } catch (pageErr) {
-          console.warn(`[warn] failed to fetch/parse page ${p}:`, pageErr && pageErr.message ? pageErr.message : pageErr);
+          const pageHtml = await fetchHtml(pageUrl);
+          for (const s of parseListPageForSlugs(pageHtml)) slugs.add(s);
+          await sleep(150 + Math.random()*200);
+        } catch (err) {
+          console.warn(`[warn] page ${p} fetch failed: ${err && err.message ? err.message : err}`);
         }
       }
     }
 
     const slugArray = Array.from(slugs);
-    console.log('[info] total unique slugs collected =', slugArray.length);
+    console.log('[info] collected slugs=', slugArray.length);
 
     const allowedTypesForCountry = excludePremieres ? [3,4,5,6] : null;
 
     const results = await asyncMapLimit(slugArray, CONCURRENCY, async (slug) => {
       const filmResult = {
-        film_query: slug,
-        film_name: null,
-        tmdb_id: null,
-        country_release: null,
-        country_release_type: null,
-        digital_release: null,
-        digital_release_type: null
+        film_query: slug, film_name: null, tmdb_id: null,
+        country_release: null, country_release_type: null,
+        digital_release: null, digital_release_type: null
       };
 
       const filmUrl = `https://letterboxd.com/film/${slug}/`;
       try {
-        const r = await fetchWithRetries(filmUrl);
-        const html = await r.text();
+        const html = await fetchHtml(filmUrl);
         const cleanTitle = extractCleanTitleFromHtml(html);
         if (cleanTitle) filmResult.film_name = cleanTitle;
         const parsedTmdb = extractTmdbFromFilmHtml(html);
@@ -307,31 +325,28 @@ module.exports = async (req, res) => {
         }
       }
 
-      await sleep(40 + Math.random() * 80);
+      await sleep(40 + Math.random()*60);
       return filmResult;
     });
 
-    // NEW sorting: sort by the earliest available date between country_release and digital_release (earliest -> newest),
-    // then by film_name alphabetical. Rows with no dates go last.
+    // sort by earliest available date (country or digital), then by name
     function dateKey(d) { return d ? Number(d.split('-').reverse().join('')) : Number.MAX_SAFE_INTEGER; }
     function earliestKey(item) {
       const a = dateKey(item.country_release);
       const b = dateKey(item.digital_release);
-      return Math.min(a, b);
+      return Math.min(a,b);
     }
 
-    results.sort((a, b) => {
-      const ka = earliestKey(a);
-      const kb = earliestKey(b);
+    results.sort((a,b) => {
+      const ka = earliestKey(a), kb = earliestKey(b);
       if (ka !== kb) return ka - kb;
-      return ( (a.film_name || '').localeCompare(b.film_name || '') );
+      return (a.film_name || '').localeCompare(b.film_name || '');
     });
 
-    console.log('[done] returning results count =', results.length);
-    res.setHeader('Content-Type', 'application/json');
-    return res.status(200).send(JSON.stringify({ ok: true, results }));
+    res.setHeader('Content-Type','application/json');
+    return res.status(200).send(JSON.stringify({ ok:true, results }));
   } catch (err) {
     console.error('[fatal] unexpected error', err && err.stack ? err.stack : err);
-    return res.status(500).json({ ok: false, error: 'Unexpected server error', detail: String(err && (err.message || err)) });
+    return res.status(500).json({ ok:false, error:'Unexpected server error', detail: String(err && (err.message || err)) });
   }
 };
